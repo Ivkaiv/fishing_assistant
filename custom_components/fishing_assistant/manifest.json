@@ -1,12 +1,19 @@
 {
     "domain": "fishing_assistant",
     "name": "Fishing Assistant",
-    "codeowners": ["@bairnhard"],
+    "codeowners": [
+        "@bairnhard"
+    ],
     "config_flow": true,
     "dependencies": [],
     "documentation": "https://github.com/bairnhard/fishing_assistant",
-    "iot_class": "cloud_polling",    
+    "iot_class": "cloud_polling",
     "issue_tracker": "https://github.com/bairnhard/fishing_assistant/issues",
-    "requirements": ["timezonefinder>=5.2,<6", "pandas", "skyfield", "jplephem"],
-    "version": "0.0.2"
+    "requirements": [
+        "timezonefinder>=5.2,<6",
+        "pandas",
+        "skyfield",
+        "jplephem"
+    ],
+    "version": "0.0.3"
 }
