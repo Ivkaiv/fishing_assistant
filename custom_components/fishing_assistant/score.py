@@ -84,7 +84,7 @@ async def get_fish_score_forecast(
     end_date = today + datetime.timedelta(days=6)
 
     # Get moon + sun event timings from Skyfield
-    astro_data = await calculate_astronomy_forecast(hass, lat, lon, days=7)
+    astro_data = await calculate_astronomy_forecast(hass, lat, lon, timezone, days=7)
 
     if not astro_data:
         return {}
