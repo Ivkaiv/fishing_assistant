@@ -672,12 +672,14 @@ def _score_pressure_trend(trend: float, prefers_low: bool = True) -> float:
         elif trend > 2:
             return 0.4
         return 0.7
-    # Species tolerant of / preferring stable or high pressure
+    # Species tolerant of / preferring stable or high pressure. Stable is the
+    # common case, so keep it merely "good" (0.8) rather than perfect to avoid
+    # pinning these species at the top every day.
     if trend > 2:
-        return 0.7
+        return 0.6
     elif trend < -2:
-        return 0.8
-    return 1.0
+        return 0.7
+    return 0.8
 
 def _score_wind(speed: float) -> float:
     # Assumes km/h
