@@ -11,7 +11,8 @@
             "latitude": "Latitude",
             "longitude": "Longitude",
             "fish": "Target species",
-            "body_type": "Body type"
+            "body_type": "Body type",
+            "weather_source": "Weather source"
           }
         }
       },
@@ -25,7 +26,8 @@
           "title": "Fishing Assistant Options",
           "data": {
             "fish": "Target species",
-            "body_type": "Body type"
+            "body_type": "Body type",
+            "weather_source": "Weather source"
           }
         }
       }

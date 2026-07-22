@@ -8,13 +8,27 @@ import datetime
 
 from .score import get_fish_score_forecast, scale_score
 
+
+def default_weather_source(hass) -> str:
+    """Pick a sensible default weather source.
+
+    Prefer a PirateWeather entity if the user has one (full 7-day hourly
+    forecast with all fields), otherwise fall back to the Open-Meteo model.
+    """
+    for state in hass.states.async_all("weather"):
+        if "pirateweather" in state.entity_id:
+            return state.entity_id
+    return "open_meteo"
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     async_add_entities
 ):
     """Set up fishing assistant sensors from a config entry."""
-    data = config_entry.data
+    # Options (set via the reconfigure dialog) override the original data.
+    data = {**config_entry.data, **config_entry.options}
     sensors = []
 
     name = data["name"]
@@ -24,6 +38,7 @@ async def async_setup_entry(
     body_type = data["body_type"]
     timezone = data["timezone"]
     elevation = data["elevation"]
+    weather_source = data.get("weather_source") or default_weather_source(hass)
 
     for fish in fish_list:
         sensors.append(
@@ -31,10 +46,11 @@ async def async_setup_entry(
                 name=name,
                 fish=fish,
                 lat=lat,
-                lon=lon,                
+                lon=lon,
                 timezone=timezone,
                 body_type=body_type,
                 elevation=elevation,
+                weather_source=weather_source,
                 config_entry_id=config_entry.entry_id
             )
         )
@@ -45,9 +61,10 @@ async def async_setup_entry(
 class FishScoreSensor(SensorEntity):
     should_poll = True
     
-    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id):
+    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id, weather_source="open_meteo"):
         self._last_update_hour = None
         self._config_entry_id = config_entry_id
+        self._weather_source = weather_source
         self._device_identifier = f"{name}_{lat}_{lon}"
         self._name = f"{name.lower().replace(' ', '_')}_{fish}_score"
         self._friendly_name = f"{name} ({fish.title()}) Fishing Score"
@@ -60,6 +77,7 @@ class FishScoreSensor(SensorEntity):
             "body_type": body_type,
             "timezone": timezone,
             "elevation": elevation,
+            "weather_source": weather_source,
         }
 
     @property
@@ -120,13 +138,19 @@ class FishScoreSensor(SensorEntity):
             timezone=self._attrs["timezone"],
             elevation=self._attrs["elevation"],
             body_type=self._attrs["body_type"],
+            weather_source=self._weather_source,
         )
+
+        # Separate the meta block (which data source actually produced the
+        # forecast) from the per-day data before storing it.
+        meta = forecast.pop("meta", {})
 
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         today_data = forecast.get(today_str, {})
         self._state = today_data.get("score", 0)
 
         self._attrs["forecast"] = forecast
+        self._attrs["weather_source_active"] = meta.get("weather_source", self._weather_source)
         self._last_update_hour = now.hour
 
     async def async_added_to_hass(self):

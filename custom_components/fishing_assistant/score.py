@@ -1,6 +1,8 @@
 from homeassistant.core import HomeAssistant
 import datetime
-from typing import Dict
+from datetime import timezone as _tzutc
+from zoneinfo import ZoneInfo
+from typing import Dict, Optional
 import aiohttp
 import pandas as pd
 import logging
@@ -66,44 +68,76 @@ def get_profile_weights(body_type: str) -> dict:
     return weights
 
 
-async def get_fish_score_forecast(
-    hass: HomeAssistant,
-    fish: str,
-    lat: float,
-    lon: float,
-    timezone: str,
-    elevation: float,
-    body_type: str,
-) -> Dict[str, Dict[str, str | float]]:
-    fish_profile = FISH_PROFILES.get(fish)
-    if not fish_profile:
-        _LOGGER.warning(f"No fish profile found for '{fish}'")
-        return {}
+# ----------------------------
+# Unit conversion helpers
+# ----------------------------
 
+def _to_celsius(value, unit):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if unit in ("°F", "F", "fahrenheit"):
+        return (value - 32) * 5 / 9
+    return value
+
+
+def _to_hpa(value, unit):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = (unit or "hPa").lower()
+    if u in ("mmhg", "mm hg"):
+        return value * 1.33322
+    if u in ("inhg", "in hg"):
+        return value * 33.8639
+    return value  # hPa / mbar
+
+
+def _to_kmh(value, unit):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = (unit or "km/h").lower()
+    if u in ("m/s", "ms"):
+        return value * 3.6
+    if u in ("mph",):
+        return value * 1.60934
+    if u in ("kn", "kt", "knot", "knots"):
+        return value * 1.852
+    return value  # km/h
+
+
+def _to_mm(value, unit):
+    if value is None:
+        return 0.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    u = (unit or "mm").lower()
+    if u in ("in", "inch", "inches"):
+        return value * 25.4
+    return value
+
+
+# ----------------------------
+# Hourly data sources
+# ----------------------------
+
+async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation) -> Optional[pd.DataFrame]:
+    """Return an hourly weather DataFrame from the Open-Meteo model."""
     today = datetime.date.today()
     end_date = today + datetime.timedelta(days=6)
-
-    # Get moon + sun event timings from Skyfield
-    astro_data = await calculate_astronomy_forecast(hass, lat, lon, timezone, days=7)
-
-    if not astro_data:
-        return {}
-
     try:
-        # Log the exact values being sent to the API
-        _LOGGER.debug(f"Making Open-Meteo API request with lat={lat} ({type(lat)}), lon={lon} ({type(lon)})")
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m",
-            "daily": "sunrise,sunset",
-            "timezone": timezone,
-            "elevation": elevation,
-            "start_date": str(today),
-            "end_date": str(end_date)
-        }
-        _LOGGER.debug(f"Full API parameters: {params}")
-
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 OPEN_METEO_URL,
@@ -112,36 +146,133 @@ async def get_fish_score_forecast(
                     "longitude": lon,
                     "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m",
                     "daily": "sunrise,sunset",
-                    "timezone": timezone,
+                    "timezone": tz_name,
                     "elevation": elevation,
                     "start_date": str(today),
-                    "end_date": str(end_date)
+                    "end_date": str(end_date),
                 },
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as response:
                 if response.status != 200:
-                    error_text = await response.text()
-                    _LOGGER.error(f"Open-Meteo API error: Status {response.status}, Response: {error_text}")
-                    return {}
-
+                    _LOGGER.error("Open-Meteo API error: %s", response.status)
+                    return None
                 data = await response.json()
-                _LOGGER.debug(f"Open-Meteo response: {data}")
-                if "hourly" not in data or "daily" not in data:
-                    _LOGGER.warning(f"Fishing forecast fetch failed for {fish} at {lat}, {lon}: {data}")
-                    return {}
+                if "hourly" not in data:
+                    _LOGGER.warning("Open-Meteo response missing hourly: %s", data)
+                    return None
     except Exception as e:
-        _LOGGER.error(f"Exception while fetching Open-Meteo data: {e}")
+        _LOGGER.error("Exception while fetching Open-Meteo data: %s", e)
+        return None
+
+    h = data["hourly"]
+    return pd.DataFrame({
+        "datetime": pd.to_datetime(h["time"]),
+        "temp": h["temperature_2m"],
+        "cloud": h["cloudcover"],
+        "pressure": h["pressure_msl"],
+        "precip": h["precipitation"],
+        "wind": h["windspeed_10m"],
+    })
+
+
+async def _hourly_from_weather_entity(hass, entity_id, tz_name) -> Optional[pd.DataFrame]:
+    """Return an hourly weather DataFrame from a HA weather.* entity."""
+    try:
+        resp = await hass.services.async_call(
+            "weather",
+            "get_forecasts",
+            {"entity_id": entity_id, "type": "hourly"},
+            blocking=True,
+            return_response=True,
+        )
+    except Exception as e:
+        _LOGGER.warning("weather.get_forecasts failed for %s: %s", entity_id, e)
+        return None
+
+    forecast = ((resp or {}).get(entity_id) or {}).get("forecast") or []
+    if not forecast:
+        _LOGGER.warning("No hourly forecast returned by %s", entity_id)
+        return None
+
+    state = hass.states.get(entity_id)
+    attrs = state.attributes if state else {}
+    t_unit = attrs.get("temperature_unit", "°C")
+    p_unit = attrs.get("pressure_unit", "hPa")
+    w_unit = attrs.get("wind_speed_unit", "km/h")
+    pr_unit = attrs.get("precipitation_unit", "mm")
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = _tzutc.utc
+
+    rows = []
+    for item in forecast:
+        dt_raw = item.get("datetime")
+        if not dt_raw:
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(dt_raw)
+        except Exception:
+            continue
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(tz)
+        rows.append({
+            "datetime": dt.replace(tzinfo=None),
+            "temp": _to_celsius(item.get("temperature"), t_unit),
+            # cloud_coverage may be absent (e.g. Gismeteo) -> NaN, handled in scoring
+            "cloud": item.get("cloud_coverage"),
+            "pressure": _to_hpa(item.get("pressure"), p_unit),
+            "precip": _to_mm(item.get("precipitation"), pr_unit),
+            "wind": _to_kmh(item.get("wind_speed"), w_unit),
+        })
+
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    return df
+
+
+async def get_fish_score_forecast(
+    hass: HomeAssistant,
+    fish: str,
+    lat: float,
+    lon: float,
+    timezone: str,
+    elevation: float,
+    body_type: str,
+    weather_source: str = "open_meteo",
+) -> Dict[str, Dict[str, str | float]]:
+    fish_profile = FISH_PROFILES.get(fish)
+    if not fish_profile:
+        _LOGGER.warning(f"No fish profile found for '{fish}'")
         return {}
 
-    # Units: temp °C, cloud %, pressure hPa, wind km/h, precip mm
-    hourly = pd.DataFrame({
-        "datetime": pd.to_datetime(data["hourly"]["time"]),
-        "temp": data["hourly"]["temperature_2m"],
-        "cloud": data["hourly"]["cloudcover"],
-        "pressure": data["hourly"]["pressure_msl"],
-        "precip": data["hourly"]["precipitation"],
-        "wind": data["hourly"]["windspeed_10m"]
-    })
+    # Moon + sun event timings (already local-timezone aware)
+    astro_data = await calculate_astronomy_forecast(hass, lat, lon, timezone, days=7)
+    if not astro_data:
+        return {}
+
+    # Pick the hourly weather source; fall back to Open-Meteo if a chosen
+    # weather entity is missing, errors, or returns too short a horizon.
+    used_source = "open_meteo"
+    hourly = None
+    if weather_source and weather_source not in ("open_meteo", "", None):
+        hourly = await _hourly_from_weather_entity(hass, weather_source, timezone)
+        if hourly is None or len(hourly) < 6:
+            _LOGGER.info(
+                "Weather source '%s' unusable for %s, falling back to Open-Meteo",
+                weather_source, fish,
+            )
+            hourly = None
+        else:
+            used_source = weather_source
+    if hourly is None:
+        hourly = await _hourly_from_open_meteo(hass, lat, lon, timezone, elevation)
+        used_source = "open_meteo"
+    if hourly is None or hourly.empty:
+        return {}
 
     hourly["date"] = hourly["datetime"].dt.date
     hourly["hour"] = hourly["datetime"].dt.hour
@@ -149,7 +280,6 @@ async def get_fish_score_forecast(
 
     forecast = {}
     weights = get_profile_weights(body_type)
-
 
     for date, group in hourly.groupby("date"):
         date_str = str(date)
@@ -160,7 +290,10 @@ async def get_fish_score_forecast(
             score = _score_hour(row=row, profile=fish_profile, astro=astro, weights=weights)
             scores.append((row["hour"], score))
 
-        # Best 3-hour rolling window
+        if len(scores) < 3:
+            continue
+
+        # Best 3-hour rolling window (overall)
         best_avg = 0
         best_window = ("--:--", "--:--")
         for i in range(len(scores) - 2):
@@ -171,13 +304,10 @@ async def get_fish_score_forecast(
 
         # Daily score is the average of all hourly scores, not the best 3-hour
         # window. The best window is still reported separately as "best_window".
-        # Using the best window as the daily score pinned nearly every day at
-        # the maximum, because dawn/dusk hours almost always score ~1.0.
         day_mean = sum(s for _, s in scores) / len(scores) if scores else 0
 
-        # Also expose the best window separately for the morning (start hour
-        # < 12) and the evening (start hour >= 12), since fish typically bite
-        # around both dawn and dusk and a single best_window only shows one.
+        # Best window separately for morning (start hour < 12) and evening
+        # (start hour >= 12) — fish typically bite around both dawn and dusk.
         def _best_window(pred):
             b_avg = -1.0
             b_win = None
@@ -196,8 +326,9 @@ async def get_fish_score_forecast(
             "best_window_am": _best_window(lambda h: h < 12),
             "best_window_pm": _best_window(lambda h: h >= 12),
         }
-        
-    _LOGGER.debug(f"Forecast for {fish} on {lat},{lon}: {forecast}")
+
+    if forecast:
+        forecast["meta"] = {"weather_source": used_source}
 
     return forecast
 
@@ -206,7 +337,8 @@ def _score_hour(row, profile, astro, weights: dict) -> float:
     hour = row["hour"]
 
     temp_score = _score_temp(row["temp"], profile["temp_range"])
-    cloud_score = 1 - abs(row["cloud"] - profile["ideal_cloud"]) / 100
+    cloud = row["cloud"]
+    cloud_score = 0.7 if pd.isna(cloud) else 1 - abs(cloud - profile["ideal_cloud"]) / 100
     press_score = _score_pressure_trend(row["pressure_trend"])
     wind_score = _score_wind(row["wind"])
     precip_score = _score_precip(row["precip"])
@@ -240,8 +372,10 @@ def _score_hour(row, profile, astro, weights: dict) -> float:
 # Individual scoring functions
 # ----------------------------
 
-def _score_temp(temp: float, ideal_range: tuple[float, float]) -> float:
+def _score_temp(temp: float, ideal_range) -> float:
     # Note: temp is air temp in °C, used as proxy for water temp.
+    if temp is None or pd.isna(temp):
+        return 0.7
     low, high = ideal_range
     if temp < low:
         return max(0, (temp - (low - 10)) / 10)
@@ -260,6 +394,8 @@ def _score_pressure_trend(trend: float) -> float:
 
 def _score_wind(speed: float) -> float:
     # Assumes km/h
+    if speed is None or pd.isna(speed):
+        return 0.7
     if speed < 2:
         return 0.8
     elif speed < 6:
@@ -270,6 +406,8 @@ def _score_wind(speed: float) -> float:
 
 def _score_precip(amount: float) -> float:
     # Assumes mm/h
+    if amount is None or pd.isna(amount):
+        return 0.7
     if amount == 0:
         return 0.7
     elif amount < 1:
