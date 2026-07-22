@@ -49,6 +49,8 @@ async def async_setup_entry(
     # time, because the chosen weather integration can load AFTER us during
     # startup — resolving it once here would freeze it to Open-Meteo.
     weather_source = data.get("weather_source")
+    temp_sensor = data.get("temperature_sensor")
+    pressure_sensor = data.get("pressure_sensor")
 
     for fish in fish_list:
         sensors.append(
@@ -61,6 +63,8 @@ async def async_setup_entry(
                 body_type=body_type,
                 elevation=elevation,
                 weather_source=weather_source,
+                temp_sensor=temp_sensor,
+                pressure_sensor=pressure_sensor,
                 config_entry_id=config_entry.entry_id
             )
         )
@@ -71,9 +75,12 @@ async def async_setup_entry(
 class FishScoreSensor(SensorEntity):
     should_poll = False
 
-    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id, weather_source=None):
+    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id,
+                 weather_source=None, temp_sensor=None, pressure_sensor=None):
         self._config_entry_id = config_entry_id
         self._weather_source = weather_source
+        self._temp_sensor = temp_sensor
+        self._pressure_sensor = pressure_sensor
         self._device_identifier = f"{name}_{lat}_{lon}"
         self._name = f"{name.lower().replace(' ', '_')}_{fish}_score"
         self._friendly_name = f"{name} ({fish.title()}) Fishing Score"
@@ -87,6 +94,8 @@ class FishScoreSensor(SensorEntity):
             "timezone": timezone,
             "elevation": elevation,
             "weather_source": weather_source or "auto",
+            "temperature_sensor": temp_sensor,
+            "pressure_sensor": pressure_sensor,
         }
 
     @property
@@ -147,6 +156,8 @@ class FishScoreSensor(SensorEntity):
             elevation=self._attrs["elevation"],
             body_type=self._attrs["body_type"],
             weather_source=self._effective_source(),
+            temp_sensor=self._temp_sensor,
+            pressure_sensor=self._pressure_sensor,
         )
 
         # Separate the meta block (which data source actually produced the
@@ -160,6 +171,8 @@ class FishScoreSensor(SensorEntity):
             self._state = today_data.get("score", 0)
             self._attrs["forecast"] = forecast
             self._attrs["weather_source_active"] = active
+            self._attrs["local_temp_used"] = meta.get("local_temp", False)
+            self._attrs["local_pressure_used"] = meta.get("local_pressure", False)
 
     async def _scheduled_update(self, _now):
         """Recompute at the scheduled refresh times (0/6/12/18)."""

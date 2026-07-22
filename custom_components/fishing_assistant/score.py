@@ -277,6 +277,8 @@ async def get_fish_score_forecast(
     elevation: float,
     body_type: str,
     weather_source: str = "open_meteo",
+    temp_sensor: str = None,
+    pressure_sensor: str = None,
 ) -> Dict[str, Dict[str, str | float]]:
     fish_profile = FISH_PROFILES.get(fish)
     if not fish_profile:
@@ -316,6 +318,13 @@ async def get_fish_score_forecast(
     hourly["date"] = hourly["datetime"].dt.date
     hourly["hour"] = hourly["datetime"].dt.hour
     hourly["pressure_trend"] = hourly["pressure"].diff()
+
+    # Optional local sensors override today's data with real readings.
+    local_used = {"temp": False, "pressure": False}
+    if temp_sensor or pressure_sensor:
+        hourly, local_used = await _apply_local_sensors(
+            hass, hourly, temp_sensor, pressure_sensor, timezone
+        )
 
     forecast = {}
     weights = get_profile_weights(body_type)
@@ -367,9 +376,87 @@ async def get_fish_score_forecast(
         }
 
     if forecast:
-        forecast["meta"] = {"weather_source": used_source}
+        forecast["meta"] = {
+            "weather_source": used_source,
+            "local_temp": local_used["temp"],
+            "local_pressure": local_used["pressure"],
+        }
 
     return forecast
+
+
+async def _apply_local_sensors(hass, hourly, temp_sensor, pressure_sensor, tz_name):
+    """Override today's rows with real local sensor readings where available.
+
+    Returns (hourly, used) where `used` flags which overrides were applied."""
+    used = {"temp": False, "pressure": False}
+    today = datetime.date.today()
+    today_mask = hourly["date"] == today
+    if not today_mask.any():
+        return hourly, used
+
+    # Local/water temperature: replace today's air-temp proxy with the real
+    # reading (air temp is a poor stand-in for water temperature).
+    if temp_sensor:
+        st = hass.states.get(temp_sensor)
+        if st and st.state not in (None, "unknown", "unavailable", ""):
+            val = _to_celsius(st.state, st.attributes.get("unit_of_measurement"))
+            if val is not None:
+                hourly.loc[today_mask, "temp"] = val
+                used["temp"] = True
+
+    # Local barometer: override today's pressure trend with the real recent
+    # trend (the single strongest weather predictor for fishing).
+    if pressure_sensor:
+        try:
+            trend = await _pressure_trend_from_history(hass, pressure_sensor, tz_name)
+            if trend is not None:
+                hourly.loc[today_mask, "pressure_trend"] = trend
+                used["pressure"] = True
+        except Exception as e:
+            _LOGGER.warning("Local pressure trend failed for %s: %s", pressure_sensor, e)
+
+    return hourly, used
+
+
+async def _pressure_trend_from_history(hass, sensor_id, tz_name):
+    """Compute the pressure tendency (hPa/hour) from the last ~3h of a local
+    barometer's recorder history."""
+    from homeassistant.components.recorder import history, get_instance
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = _tzutc.utc
+    now = datetime.datetime.now(tz)
+    start = now - datetime.timedelta(hours=3)
+
+    states_dict = await get_instance(hass).async_add_executor_job(
+        history.state_changes_during_period, hass, start, now, sensor_id
+    )
+    states = states_dict.get(sensor_id, []) if states_dict else []
+
+    unit = None
+    points = []
+    for s in states:
+        if s.state in (None, "unknown", "unavailable", ""):
+            continue
+        if unit is None:
+            unit = s.attributes.get("unit_of_measurement")
+        p = _to_hpa(s.state, unit or "hPa")
+        changed = getattr(s, "last_changed", None)
+        if p is None or changed is None:
+            continue
+        points.append((changed.timestamp(), p))
+
+    if len(points) < 2:
+        return None
+    points.sort()
+    (t0, p0), (t1, p1) = points[0], points[-1]
+    hours = (t1 - t0) / 3600.0
+    if hours < 0.5:
+        return None
+    return (p1 - p0) / hours
 
 
 def _score_hour(row, profile, astro, weights: dict) -> float:

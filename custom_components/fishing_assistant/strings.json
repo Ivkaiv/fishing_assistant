@@ -1,35 +1,39 @@
 {
+  "title": "Fishing Assistant",
+  "config": {
     "title": "Fishing Assistant",
-    "config": {
-      "title": "Fishing Assistant",
-      "step": {
-        "user": {
-          "title": "Add Fishing Location",
-          "description": "Set up a fishing location with target species and water body type.",
-          "data": {
-            "name": "Location name",
-            "latitude": "Latitude",
-            "longitude": "Longitude",
-            "fish": "Target species",
-            "body_type": "Body type",
-            "weather_source": "Weather source"
-          }
+    "step": {
+      "user": {
+        "title": "Add Fishing Location",
+        "description": "Set up a fishing location with target species and water body type.",
+        "data": {
+          "name": "Location name",
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "fish": "Target species",
+          "body_type": "Body type",
+          "weather_source": "Weather source",
+          "temperature_sensor": "Water temperature sensor (optional)",
+          "pressure_sensor": "Pressure sensor / barometer (optional)"
         }
-      },
-      "abort": {
-        "already_configured": "This location is already configured"
       }
     },
-    "options": {
-      "step": {
-        "init": {
-          "title": "Fishing Assistant Options",
-          "data": {
-            "fish": "Target species",
-            "body_type": "Body type",
-            "weather_source": "Weather source"
-          }
+    "abort": {
+      "already_configured": "This location is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Fishing Assistant Options",
+        "data": {
+          "fish": "Target species",
+          "body_type": "Body type",
+          "weather_source": "Weather source",
+          "temperature_sensor": "Water temperature sensor (optional)",
+          "pressure_sensor": "Pressure sensor / barometer (optional)"
         }
       }
     }
   }
+}

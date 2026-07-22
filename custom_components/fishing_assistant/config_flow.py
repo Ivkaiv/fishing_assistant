@@ -27,6 +27,20 @@ def _default_weather_source(hass) -> str:
     return "open_meteo"
 
 
+def _temperature_sensor_selector():
+    return selector.EntitySelector(
+        selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
+    )
+
+
+def _pressure_sensor_selector():
+    return selector.EntitySelector(
+        selector.EntitySelectorConfig(
+            domain="sensor", device_class=["pressure", "atmospheric_pressure"]
+        )
+    )
+
+
 class FishingAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle Fishing Assistant config flow."""
 
@@ -59,6 +73,8 @@ class FishingAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "fish": fish,
                     "body_type": body_type,
                     "weather_source": weather_source,
+                    "temperature_sensor": user_input.get("temperature_sensor"),
+                    "pressure_sensor": user_input.get("pressure_sensor"),
                     "elevation": metadata.get("elevation"),
                     "timezone": metadata.get("timezone"),
                 },
@@ -88,6 +104,8 @@ class FishingAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             mode=selector.SelectSelectorMode.DROPDOWN,
                         )
                     ),
+                vol.Optional("temperature_sensor"): _temperature_sensor_selector(),
+                vol.Optional("pressure_sensor"): _pressure_sensor_selector(),
             }),
             errors=errors
         )
@@ -95,7 +113,7 @@ class FishingAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return FishingAssistantOptionsFlow(config_entry)
+        return FishingAssistantOptionsFlow()
     
     @staticmethod
     @callback
@@ -108,8 +126,8 @@ class FishingAssistantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class FishingAssistantOptionsFlow(config_entries.OptionsFlow):
     """Handle options for Fishing Assistant."""
 
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
+    # Note: don't set self.config_entry in __init__ — modern Home Assistant
+    # exposes it as a read-only property set by the flow manager.
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
@@ -144,5 +162,19 @@ class FishingAssistantOptionsFlow(config_entries.OptionsFlow):
                         mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
+                vol.Optional(
+                    "temperature_sensor",
+                    description={"suggested_value": self.config_entry.options.get(
+                        "temperature_sensor",
+                        self.config_entry.data.get("temperature_sensor"),
+                    )},
+                ): _temperature_sensor_selector(),
+                vol.Optional(
+                    "pressure_sensor",
+                    description={"suggested_value": self.config_entry.options.get(
+                        "pressure_sensor",
+                        self.config_entry.data.get("pressure_sensor"),
+                    )},
+                ): _pressure_sensor_selector(),
             })
         )
