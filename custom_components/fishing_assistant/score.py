@@ -6,6 +6,7 @@ from typing import Dict, Optional
 import aiohttp
 import pandas as pd
 import logging
+import time
 
 
 from .fish_profiles import FISH_PROFILES
@@ -133,8 +134,11 @@ def _to_mm(value, unit):
 # Hourly data sources
 # ----------------------------
 
-async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation) -> Optional[pd.DataFrame]:
-    """Return an hourly weather DataFrame from the Open-Meteo model."""
+async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation, model=None) -> Optional[pd.DataFrame]:
+    """Return an hourly weather DataFrame from Open-Meteo for these coordinates.
+
+    Optional `model` selects a specific weather model (e.g. ecmwf_ifs04,
+    gfs_seamless, icon_seamless); None uses Open-Meteo's best_match blend."""
     today = datetime.date.today()
     end_date = today + datetime.timedelta(days=6)
     params = {
@@ -147,6 +151,8 @@ async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation) -> Optiona
         "start_date": str(today),
         "end_date": str(end_date),
     }
+    if model:
+        params["models"] = model
     # Retry once: many sensors can hit Open-Meteo at the same instant (e.g. all
     # fish upgrading together), and an occasional request is rate-limited.
     data = None
@@ -268,6 +274,177 @@ async def _backfill_today(hass, hourly, lat, lon, tz_name, elevation) -> pd.Data
         return hourly
 
 
+def _pirateweather_credentials(hass):
+    """Return (endpoint, api_key) from the user's PirateWeather integration, or None."""
+    try:
+        for entry in hass.config_entries.async_entries("pirateweather"):
+            key = entry.data.get("api_key")
+            if key:
+                endpoint = (entry.data.get("endpoint") or "https://api.pirateweather.net").rstrip("/")
+                return endpoint, key
+    except Exception:
+        pass
+    return None
+
+
+async def _hourly_from_pirateweather_api(hass, lat, lon, tz_name) -> Optional[pd.DataFrame]:
+    """Return an hourly weather DataFrame from the PirateWeather API for these
+    exact coordinates (not the home-fixed HA weather entity)."""
+    creds = _pirateweather_credentials(hass)
+    if not creds:
+        return None
+    endpoint, key = creds
+    url = f"{endpoint}/forecast/{key}/{lat},{lon}"
+    params = {"units": "si", "extend": "hourly", "exclude": "minutely,daily,alerts,currently"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("PirateWeather API status %s", resp.status)
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        _LOGGER.warning("PirateWeather API error: %s", e)
+        return None
+
+    hours = (data.get("hourly") or {}).get("data") or []
+    if not hours:
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = _tzutc.utc
+    rows = []
+    for h in hours:
+        ts = h.get("time")
+        if ts is None:
+            continue
+        dt = datetime.datetime.fromtimestamp(ts, _tzutc.utc).astimezone(tz).replace(tzinfo=None)
+        cloud = h.get("cloudCover")
+        rows.append({
+            "datetime": dt,
+            "temp": h.get("temperature"),                     # si: °C
+            "cloud": cloud * 100 if cloud is not None else None,  # 0-1 -> %
+            "pressure": h.get("pressure"),                    # si: hPa
+            "precip": h.get("precipIntensity") or 0.0,        # si: mm/h
+            "wind": (h.get("windSpeed") or 0.0) * 3.6,        # si: m/s -> km/h
+        })
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    return df
+
+
+async def _water_temp_estimate(hass, lat, lon, tz_name, elevation) -> Optional[float]:
+    """Estimate water temperature at these coordinates from the recent air
+    temperature. Water has thermal inertia, so a multi-day average of air temp
+    is a far better stand-in than the raw hourly air temperature."""
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=4)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m",
+        "timezone": tz_name,
+        "elevation": elevation,
+        "start_date": str(start),
+        "end_date": str(today),
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(OPEN_METEO_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        _LOGGER.warning("Water-temp estimate fetch failed: %s", e)
+        return None
+    temps = [t for t in (data.get("hourly") or {}).get("temperature_2m", []) if t is not None]
+    if not temps:
+        return None
+    return round(sum(temps) / len(temps), 1)
+
+
+async def _fetch_hourly(hass, lat, lon, tz_name, elevation, weather_source):
+    """Dispatch to the chosen weather backend; return (hourly_df, used_source).
+
+    Falls back to Open-Meteo if the chosen backend errors or is too short."""
+    src = weather_source
+    hourly = None
+    used = "open_meteo"
+    if src == "pirateweather":
+        hourly = await _hourly_from_pirateweather_api(hass, lat, lon, tz_name)
+        if hourly is not None and len(hourly) >= 6:
+            used = "pirateweather"
+        else:
+            hourly = None
+    elif src and str(src).startswith("weather."):
+        hourly = await _hourly_from_weather_entity(hass, src, tz_name)
+        if hourly is not None and len(hourly) >= 6:
+            used = src
+        else:
+            hourly = None
+    elif src and str(src).startswith("open_meteo:"):
+        model = str(src).split(":", 1)[1]
+        hourly = await _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation, model)
+        if hourly is not None and not hourly.empty:
+            used = src
+        else:
+            hourly = None
+    if hourly is None:
+        hourly = await _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation)
+        used = "open_meteo"
+    return hourly, used
+
+
+# Per-location cache: all fish at one water body share a single weather/astro
+# fetch (avoids N identical requests and Open-Meteo rate-limiting). Keyed by the
+# inputs that change the data, with a short TTL.
+_LOCATION_CACHE = {}
+_CACHE_TTL = 300  # seconds
+
+
+async def _get_location_data(hass, lat, lon, timezone, elevation, weather_source, temp_sensor, pressure_sensor):
+    """Fetch and prepare the shared per-location hourly + astro data (cached)."""
+    key = (
+        round(float(lat), 5), round(float(lon), 5), str(weather_source),
+        str(temp_sensor), str(pressure_sensor), round(float(elevation or 0)),
+    )
+    now = time.monotonic()
+    cached = _LOCATION_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    astro_data = await calculate_astronomy_forecast(hass, lat, lon, timezone, days=7)
+    if not astro_data:
+        return None
+
+    hourly, used_source = await _fetch_hourly(hass, lat, lon, timezone, elevation, weather_source)
+    if hourly is None or hourly.empty:
+        return None
+
+    # Future-only sources (PirateWeather API, HA weather entities) miss today's
+    # already-passed hours — backfill them from Open-Meteo's observed past hours.
+    if used_source == "pirateweather" or str(used_source).startswith("weather."):
+        hourly = await _backfill_today(hass, hourly, lat, lon, timezone, elevation)
+
+    hourly["date"] = hourly["datetime"].dt.date
+    hourly["hour"] = hourly["datetime"].dt.hour
+    hourly["pressure_trend"] = hourly["pressure"].diff()
+
+    hourly, local_used = await _apply_local_sensors(
+        hass, hourly, temp_sensor, pressure_sensor, lat, lon, timezone, elevation
+    )
+
+    result = (hourly, astro_data, used_source, local_used)
+    for k, v in list(_LOCATION_CACHE.items()):
+        if v[0] <= now:
+            _LOCATION_CACHE.pop(k, None)
+    _LOCATION_CACHE[key] = (now + _CACHE_TTL, result)
+    return result
+
+
 async def get_fish_score_forecast(
     hass: HomeAssistant,
     fish: str,
@@ -285,46 +462,12 @@ async def get_fish_score_forecast(
         _LOGGER.warning(f"No fish profile found for '{fish}'")
         return {}
 
-    # Moon + sun event timings (already local-timezone aware)
-    astro_data = await calculate_astronomy_forecast(hass, lat, lon, timezone, days=7)
-    if not astro_data:
+    location = await _get_location_data(
+        hass, lat, lon, timezone, elevation, weather_source, temp_sensor, pressure_sensor
+    )
+    if location is None:
         return {}
-
-    # Pick the hourly weather source; fall back to Open-Meteo if a chosen
-    # weather entity is missing, errors, or returns too short a horizon.
-    used_source = "open_meteo"
-    hourly = None
-    if weather_source and weather_source not in ("open_meteo", "", None):
-        hourly = await _hourly_from_weather_entity(hass, weather_source, timezone)
-        if hourly is None or len(hourly) < 6:
-            _LOGGER.info(
-                "Weather source '%s' unusable for %s, falling back to Open-Meteo",
-                weather_source, fish,
-            )
-            hourly = None
-        else:
-            used_source = weather_source
-    if hourly is None:
-        hourly = await _hourly_from_open_meteo(hass, lat, lon, timezone, elevation)
-        used_source = "open_meteo"
-    if hourly is None or hourly.empty:
-        return {}
-
-    # A weather entity only forecasts future hours, so backfill today's
-    # already-passed hours from Open-Meteo (which provides observed past hours).
-    if used_source != "open_meteo":
-        hourly = await _backfill_today(hass, hourly, lat, lon, timezone, elevation)
-
-    hourly["date"] = hourly["datetime"].dt.date
-    hourly["hour"] = hourly["datetime"].dt.hour
-    hourly["pressure_trend"] = hourly["pressure"].diff()
-
-    # Optional local sensors override today's data with real readings.
-    local_used = {"temp": False, "pressure": False}
-    if temp_sensor or pressure_sensor:
-        hourly, local_used = await _apply_local_sensors(
-            hass, hourly, temp_sensor, pressure_sensor, timezone
-        )
+    hourly, astro_data, used_source, local_used = location
 
     forecast = {}
     weights = get_profile_weights(body_type)
@@ -385,32 +528,37 @@ async def get_fish_score_forecast(
     return forecast
 
 
-async def _apply_local_sensors(hass, hourly, temp_sensor, pressure_sensor, tz_name):
-    """Override today's rows with real local sensor readings where available.
+async def _apply_local_sensors(hass, hourly, temp_sensor, pressure_sensor, lat, lon, tz_name, elevation):
+    """Replace air-temp-as-water and modelled pressure with better data.
 
-    Returns (hourly, used) where `used` flags which overrides were applied."""
+    Temperature (used as water temperature): a physical sensor wins for today;
+    otherwise estimate water temperature from the recent air temperature at the
+    pond's own coordinates (applied to every day, since water temp is stable).
+    Pressure: a local barometer's real recent trend overrides today's modelled
+    trend. Returns (hourly, used) where used flags what was applied.
+    """
     used = {"temp": False, "pressure": False}
     today = datetime.date.today()
     today_mask = hourly["date"] == today
-    if not today_mask.any():
-        return hourly, used
 
-    # Local/water temperature: replace today's air-temp proxy with the real
-    # reading (air temp is a poor stand-in for water temperature).
     if temp_sensor:
         st = hass.states.get(temp_sensor)
         if st and st.state not in (None, "unknown", "unavailable", ""):
             val = _to_celsius(st.state, st.attributes.get("unit_of_measurement"))
-            if val is not None:
+            if val is not None and today_mask.any():
                 hourly.loc[today_mask, "temp"] = val
-                used["temp"] = True
+                used["temp"] = "sensor"
 
-    # Local barometer: override today's pressure trend with the real recent
-    # trend (the single strongest weather predictor for fishing).
+    if not used["temp"]:
+        est = await _water_temp_estimate(hass, lat, lon, tz_name, elevation)
+        if est is not None:
+            hourly["temp"] = est
+            used["temp"] = "estimate"
+
     if pressure_sensor:
         try:
             trend = await _pressure_trend_from_history(hass, pressure_sensor, tz_name)
-            if trend is not None:
+            if trend is not None and today_mask.any():
                 hourly.loc[today_mask, "pressure_trend"] = trend
                 used["pressure"] = True
         except Exception as e:
@@ -465,7 +613,9 @@ def _score_hour(row, profile, astro, weights: dict) -> float:
     temp_score = _score_temp(row["temp"], profile["temp_range"])
     cloud = row["cloud"]
     cloud_score = 0.7 if pd.isna(cloud) else 1 - abs(cloud - profile["ideal_cloud"]) / 100
-    press_score = _score_pressure_trend(row["pressure_trend"])
+    press_score = _score_pressure_trend(
+        row["pressure_trend"], profile.get("prefers_low_pressure", True)
+    )
     wind_score = _score_wind(row["wind"])
     precip_score = _score_precip(row["precip"])
 
@@ -509,14 +659,25 @@ def _score_temp(temp: float, ideal_range) -> float:
         return max(0, (high + 10 - temp) / 10)
     return 1.0
 
-def _score_pressure_trend(trend: float) -> float:
+def _score_pressure_trend(trend: float, prefers_low: bool = True) -> float:
+    # Fish that prefer low/falling pressure feed hard as a front approaches and
+    # shut down on a rising barometer. Species that don't are the opposite:
+    # they do best on a stable barometer. `prefers_low_pressure` per fish
+    # (previously defined but unused) now actually drives this.
     if pd.isna(trend):
         return 0.7
-    if trend < -2:
-        return 1.0
-    elif trend > 2:
-        return 0.4
-    return 0.7
+    if prefers_low:
+        if trend < -2:
+            return 1.0
+        elif trend > 2:
+            return 0.4
+        return 0.7
+    # Species tolerant of / preferring stable or high pressure
+    if trend > 2:
+        return 0.7
+    elif trend < -2:
+        return 0.8
+    return 1.0
 
 def _score_wind(speed: float) -> float:
     # Assumes km/h
@@ -550,10 +711,12 @@ def _score_twilight(hour: int, sunrise, sunset) -> float:
     return 0.7
 
 def _score_moon_phase(phase: float) -> float:
-    # 0.0 = New, 0.5 = Full, 1.0 = New
+    # `phase` is the Moon's illuminated fraction: 0.0 = new, 1.0 = full.
+    # Solunar theory rates both the new and the full moon best, so reward both
+    # extremes and score the quarters lower.
     if phase is None:
         return 0.7  # Default score when moon phase data is missing
-    if phase < 0.1 or phase > 0.9:
+    if phase < 0.15 or phase > 0.85:
         return 1.0
     return 0.7
 

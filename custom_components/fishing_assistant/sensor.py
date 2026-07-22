@@ -16,14 +16,18 @@ from .score import get_fish_score_forecast, scale_score
 
 
 def default_weather_source(hass) -> str:
-    """Pick a sensible default weather source.
+    """Pick a sensible default weather source, resolved lazily at fetch time.
 
-    Prefer a PirateWeather entity if the user has one (full 7-day hourly
-    forecast with all fields), otherwise fall back to the Open-Meteo model.
+    Prefer coordinate-based PirateWeather (queried at the pond's own lat/lon)
+    when the user has a PirateWeather API key, otherwise the coordinate-based
+    Open-Meteo model.
     """
-    for state in hass.states.async_all("weather"):
-        if "pirateweather" in state.entity_id:
-            return state.entity_id
+    try:
+        for entry in hass.config_entries.async_entries("pirateweather"):
+            if entry.data.get("api_key"):
+                return "pirateweather"
+    except Exception:
+        pass
     return "open_meteo"
 
 
@@ -216,7 +220,8 @@ class FishScoreSensor(SensorEntity):
         # after us, or a slow/rate-limited forecast right after a restart).
         if self._weather_source != "open_meteo":
             eff = self._effective_source()
-            if eff not in ("open_meteo", "", None):
+            # Only HA weather.* sources are entities we can watch for updates.
+            if eff and str(eff).startswith("weather."):
                 self.async_on_remove(
                     async_track_state_change_event(
                         self.hass, [eff], self._on_source_changed

@@ -10,21 +10,40 @@ from .helpers.location import resolve_location_metadata_sync
 from .fish_profiles import get_fish_species
 
 
+def _pirateweather_available(hass) -> bool:
+    try:
+        for entry in hass.config_entries.async_entries("pirateweather"):
+            if entry.data.get("api_key"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _weather_source_options(hass) -> list[dict]:
-    """Build the list of selectable weather sources: Open-Meteo + weather.* entities."""
-    options = [{"value": "open_meteo", "label": "Open-Meteo (model)"}]
+    """Selectable weather sources.
+
+    Coordinate-based providers (queried at the pond's own lat/lon) come first;
+    HA weather.* entities are location-fixed to the home, so they're listed last
+    and labelled as such."""
+    options = [
+        {"value": "open_meteo", "label": "Open-Meteo — по координатам (рекоменд.)"},
+        {"value": "open_meteo:ecmwf_ifs04", "label": "Open-Meteo · модель ECMWF (по координатам)"},
+        {"value": "open_meteo:gfs_seamless", "label": "Open-Meteo · модель GFS (по координатам)"},
+        {"value": "open_meteo:icon_seamless", "label": "Open-Meteo · модель ICON (по координатам)"},
+    ]
+    if _pirateweather_available(hass):
+        options.append({"value": "pirateweather", "label": "PirateWeather — по координатам"})
     for state in sorted(hass.states.async_all("weather"), key=lambda s: s.entity_id):
         label = state.attributes.get("friendly_name") or state.entity_id
-        options.append({"value": state.entity_id, "label": f"{label} ({state.entity_id})"})
+        options.append({"value": state.entity_id, "label": f"{label} — данные для дома ({state.entity_id})"})
     return options
 
 
 def _default_weather_source(hass) -> str:
-    """Default to a PirateWeather entity if present, else Open-Meteo."""
-    for state in hass.states.async_all("weather"):
-        if "pirateweather" in state.entity_id:
-            return state.entity_id
-    return "open_meteo"
+    """Default to coordinate-based PirateWeather if the user has a key, else the
+    coordinate-based Open-Meteo model."""
+    return "pirateweather" if _pirateweather_available(hass) else "open_meteo"
 
 
 def _temperature_sensor_selector():

@@ -57,7 +57,6 @@ async def calculate_astronomy_forecast(hass: HomeAssistant, lat: float, lon: flo
     t1 = ts.utc(search_end.year, search_end.month, search_end.day)
 
     # Astronomy events
-    moon_phases = almanac.moon_phases(eph)
     moon_rise_set = almanac.risings_and_settings(eph, eph['Moon'], location)
     moon_transits = almanac.meridian_transits(eph, eph['Moon'], location)
     sun_rise_set = almanac.sunrise_sunset(eph, location)
@@ -73,11 +72,9 @@ async def calculate_astronomy_forecast(hass: HomeAssistant, lat: float, lon: flo
         "sunset": {}
     }
 
-    # Moon phase per day
-    times, phases = almanac.find_discrete(t0, t1, moon_phases)
-    for t, p in zip(times, phases):
-        date_str = str(local(t).date())
-        events["moon_phase"][date_str] = float(round(p % 1, 3))
+    # Moon phase (illuminated fraction) is computed per day in the final loop
+    # below via almanac.fraction_illuminated — the previous find_discrete()
+    # approach used `p % 1` on an integer phase index, which is always 0.
 
     # Moonrise / moonset
     times, events_raw = almanac.find_discrete(t0, t1, moon_rise_set)
@@ -110,8 +107,15 @@ async def calculate_astronomy_forecast(hass: HomeAssistant, lat: float, lon: flo
     for i in range(days):
         d = start_date + timedelta(days=i)
         ds = str(d)
+        # Illuminated fraction of the Moon at local noon: 0.0 = new, 1.0 = full.
+        try:
+            moon_frac = float(
+                almanac.fraction_illuminated(eph, "moon", ts.utc(d.year, d.month, d.day, 12))
+            )
+        except Exception:
+            moon_frac = None
         forecast[ds] = {
-            "moon_phase": events["moon_phase"].get(ds),
+            "moon_phase": moon_frac,
             "moonrise": events["moonrise"].get(ds),
             "moonset": events["moonset"].get(ds),
             "moon_transit": events["moon_transit"].get(ds),
