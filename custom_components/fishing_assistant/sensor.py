@@ -3,6 +3,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.helpers.event import (
+    async_track_time_change,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from .const import DOMAIN
 import datetime
 
@@ -38,7 +44,11 @@ async def async_setup_entry(
     body_type = data["body_type"]
     timezone = data["timezone"]
     elevation = data["elevation"]
-    weather_source = data.get("weather_source") or default_weather_source(hass)
+    # Keep the raw configured value (which may be absent for locations created
+    # before this option existed). The default is resolved lazily at fetch
+    # time, because the chosen weather integration can load AFTER us during
+    # startup — resolving it once here would freeze it to Open-Meteo.
+    weather_source = data.get("weather_source")
 
     for fish in fish_list:
         sensors.append(
@@ -59,10 +69,9 @@ async def async_setup_entry(
 
 
 class FishScoreSensor(SensorEntity):
-    should_poll = True
-    
-    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id, weather_source="open_meteo"):
-        self._last_update_hour = None
+    should_poll = False
+
+    def __init__(self, name, fish, lat, lon, body_type, timezone, elevation, config_entry_id, weather_source=None):
         self._config_entry_id = config_entry_id
         self._weather_source = weather_source
         self._device_identifier = f"{name}_{lat}_{lon}"
@@ -77,7 +86,7 @@ class FishScoreSensor(SensorEntity):
             "body_type": body_type,
             "timezone": timezone,
             "elevation": elevation,
-            "weather_source": weather_source,
+            "weather_source": weather_source or "auto",
         }
 
     @property
@@ -119,17 +128,16 @@ class FishScoreSensor(SensorEntity):
             "via_device": None            
         }
 
+    def _effective_source(self) -> str:
+        """Resolve the weather source to use right now. An unset/'auto' config
+        resolves to the default (PirateWeather if available, else Open-Meteo)
+        every time, so it upgrades once the weather integration has loaded."""
+        if self._weather_source in (None, "", "auto"):
+            return default_weather_source(self.hass)
+        return self._weather_source
+
     async def async_update(self):
         """Fetch the 7-day forecast and set today's score as state."""
-        now = datetime.datetime.now()
-        update_hours = [0, 6, 12, 18]
-    
-        if self._last_update_hour is not None and now.hour not in update_hours:
-            return
-
-        if self._last_update_hour == now.hour:
-            return
-
         forecast = await get_fish_score_forecast(
             hass=self.hass,
             fish=self._attrs["fish"],
@@ -138,20 +146,77 @@ class FishScoreSensor(SensorEntity):
             timezone=self._attrs["timezone"],
             elevation=self._attrs["elevation"],
             body_type=self._attrs["body_type"],
-            weather_source=self._weather_source,
+            weather_source=self._effective_source(),
         )
 
         # Separate the meta block (which data source actually produced the
         # forecast) from the per-day data before storing it.
         meta = forecast.pop("meta", {})
+        active = meta.get("weather_source", self._weather_source)
 
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         today_data = forecast.get(today_str, {})
-        self._state = today_data.get("score", 0)
+        if forecast:
+            self._state = today_data.get("score", 0)
+            self._attrs["forecast"] = forecast
+            self._attrs["weather_source_active"] = active
 
-        self._attrs["forecast"] = forecast
-        self._attrs["weather_source_active"] = meta.get("weather_source", self._weather_source)
-        self._last_update_hour = now.hour
+    async def _scheduled_update(self, _now):
+        """Recompute at the scheduled refresh times (0/6/12/18)."""
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def _first_update(self, _event):
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def _on_source_changed(self, _event):
+        """Recompute when the chosen weather entity posts an update, but only
+        while we are still on the Open-Meteo fallback. This upgrades to the
+        preferred source as soon as it becomes ready after a restart, without
+        polling, and stops once we're already using it."""
+        if self._attrs.get("weather_source_active") in (None, "open_meteo"):
+            await self.async_update()
+            self.async_write_ha_state()
+
+    async def _maybe_upgrade(self, _now):
+        """Every few minutes, retry the preferred weather source while we are
+        still on the Open-Meteo fallback (e.g. the chosen weather integration
+        loaded after us, or its forecast wasn't ready yet right after a
+        restart). No work once already upgraded."""
+        eff = self._effective_source()
+        wants_entity = eff not in ("open_meteo", "", None)
+        if wants_entity and self._attrs.get("weather_source_active") in (None, "open_meteo"):
+            await self.async_update()
+            self.async_write_ha_state()
 
     async def async_added_to_hass(self):
-        await self.async_update()
+        # Refresh the forecast four times a day.
+        self.async_on_remove(
+            async_track_time_change(
+                self.hass, self._scheduled_update, hour=[0, 6, 12, 18], minute=1, second=0
+            )
+        )
+        # Unless the user explicitly pinned Open-Meteo, keep trying to reach the
+        # preferred weather entity: recompute when it posts an update, and retry
+        # every 5 minutes as a guaranteed fallback (covers the entity loading
+        # after us, or a slow/rate-limited forecast right after a restart).
+        if self._weather_source != "open_meteo":
+            eff = self._effective_source()
+            if eff not in ("open_meteo", "", None):
+                self.async_on_remove(
+                    async_track_state_change_event(
+                        self.hass, [eff], self._on_source_changed
+                    )
+                )
+            self.async_on_remove(
+                async_track_time_interval(
+                    self.hass, self._maybe_upgrade, datetime.timedelta(minutes=5)
+                )
+            )
+        # Compute once now, but wait until HA has fully started so the chosen
+        # weather entity is set up before the first fetch.
+        if self.hass.is_running:
+            await self.async_update()
+        else:
+            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, self._first_update)

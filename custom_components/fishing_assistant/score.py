@@ -137,31 +137,38 @@ async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation) -> Optiona
     """Return an hourly weather DataFrame from the Open-Meteo model."""
     today = datetime.date.today()
     end_date = today + datetime.timedelta(days=6)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                OPEN_METEO_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m",
-                    "daily": "sunrise,sunset",
-                    "timezone": tz_name,
-                    "elevation": elevation,
-                    "start_date": str(today),
-                    "end_date": str(end_date),
-                },
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as response:
-                if response.status != 200:
-                    _LOGGER.error("Open-Meteo API error: %s", response.status)
-                    return None
-                data = await response.json()
-                if "hourly" not in data:
-                    _LOGGER.warning("Open-Meteo response missing hourly: %s", data)
-                    return None
-    except Exception as e:
-        _LOGGER.error("Exception while fetching Open-Meteo data: %s", e)
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m",
+        "daily": "sunrise,sunset",
+        "timezone": tz_name,
+        "elevation": elevation,
+        "start_date": str(today),
+        "end_date": str(end_date),
+    }
+    # Retry once: many sensors can hit Open-Meteo at the same instant (e.g. all
+    # fish upgrading together), and an occasional request is rate-limited.
+    data = None
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    OPEN_METEO_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                ) as response:
+                    if response.status != 200:
+                        _LOGGER.warning("Open-Meteo API status %s (attempt %s)", response.status, attempt + 1)
+                        continue
+                    body = await response.json()
+                    if "hourly" not in body:
+                        _LOGGER.warning("Open-Meteo response missing hourly: %s", body)
+                        continue
+                    data = body
+                    break
+        except Exception as e:
+            _LOGGER.warning("Open-Meteo fetch error (attempt %s): %s", attempt + 1, e)
+
+    if data is None:
         return None
 
     h = data["hourly"]
@@ -234,6 +241,33 @@ async def _hourly_from_weather_entity(hass, entity_id, tz_name) -> Optional[pd.D
     return df
 
 
+async def _backfill_today(hass, hourly, lat, lon, tz_name, elevation) -> pd.DataFrame:
+    """Prepend today's already-passed hours (missing from a weather entity's
+    future-only forecast) with the actual past-hours weather from Open-Meteo,
+    so the morning window still shows for the current day."""
+    try:
+        today = datetime.date.today()
+        today_rows = hourly[hourly["datetime"].dt.date == today]
+        earliest = int(today_rows["datetime"].dt.hour.min()) if not today_rows.empty else 24
+        if earliest <= 0:
+            return hourly  # already covers the whole day
+
+        om = await _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation)
+        if om is None or om.empty:
+            return hourly
+
+        fill = om[(om["datetime"].dt.date == today) & (om["datetime"].dt.hour < earliest)]
+        if fill.empty:
+            return hourly
+
+        merged = pd.concat([fill, hourly], ignore_index=True)
+        merged = merged.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
+        return merged
+    except Exception as e:
+        _LOGGER.warning("Today backfill failed: %s", e)
+        return hourly
+
+
 async def get_fish_score_forecast(
     hass: HomeAssistant,
     fish: str,
@@ -273,6 +307,11 @@ async def get_fish_score_forecast(
         used_source = "open_meteo"
     if hourly is None or hourly.empty:
         return {}
+
+    # A weather entity only forecasts future hours, so backfill today's
+    # already-passed hours from Open-Meteo (which provides observed past hours).
+    if used_source != "open_meteo":
+        hourly = await _backfill_today(hass, hourly, lat, lon, timezone, elevation)
 
     hourly["date"] = hourly["datetime"].dt.date
     hourly["hour"] = hourly["datetime"].dt.hour
