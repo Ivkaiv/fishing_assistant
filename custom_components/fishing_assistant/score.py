@@ -144,7 +144,7 @@ async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation, model=None
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m",
+        "hourly": "temperature_2m,cloudcover,pressure_msl,precipitation,windspeed_10m,winddirection_10m",
         "daily": "sunrise,sunset",
         "timezone": tz_name,
         "elevation": elevation,
@@ -185,6 +185,7 @@ async def _hourly_from_open_meteo(hass, lat, lon, tz_name, elevation, model=None
         "pressure": h["pressure_msl"],
         "precip": h["precipitation"],
         "wind": h["windspeed_10m"],
+        "wind_dir": h.get("winddirection_10m", [None] * len(h["time"])),
     })
 
 
@@ -238,6 +239,7 @@ async def _hourly_from_weather_entity(hass, entity_id, tz_name) -> Optional[pd.D
             "pressure": _to_hpa(item.get("pressure"), p_unit),
             "precip": _to_mm(item.get("precipitation"), pr_unit),
             "wind": _to_kmh(item.get("wind_speed"), w_unit),
+            "wind_dir": item.get("wind_bearing"),
         })
 
     if not rows:
@@ -328,6 +330,7 @@ async def _hourly_from_pirateweather_api(hass, lat, lon, tz_name) -> Optional[pd
             "pressure": h.get("pressure"),                    # si: hPa
             "precip": h.get("precipIntensity") or 0.0,        # si: mm/h
             "wind": (h.get("windSpeed") or 0.0) * 3.6,        # si: m/s -> km/h
+            "wind_dir": h.get("windBearing"),
         })
     if not rows:
         return None
@@ -351,14 +354,19 @@ async def _water_temp_estimate(hass, lat, lon, tz_name, elevation) -> Optional[f
         "start_date": str(start),
         "end_date": str(today),
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(OPEN_METEO_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-    except Exception as e:
-        _LOGGER.warning("Water-temp estimate fetch failed: %s", e)
+    data = None
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(OPEN_METEO_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        _LOGGER.warning("Water-temp estimate status %s (attempt %s)", resp.status, attempt + 1)
+                        continue
+                    data = await resp.json()
+                    break
+        except Exception as e:
+            _LOGGER.warning("Water-temp estimate fetch error (attempt %s): %s", attempt + 1, e)
+    if data is None:
         return None
     temps = [t for t in (data.get("hourly") or {}).get("temperature_2m", []) if t is not None]
     if not temps:
@@ -526,6 +534,92 @@ async def get_fish_score_forecast(
         }
 
     return forecast
+
+
+def _compass(deg):
+    if deg is None:
+        return None
+    try:
+        deg = float(deg)
+    except (TypeError, ValueError):
+        return None
+    dirs = ["С", "ССВ", "СВ", "ВСВ", "В", "ВЮВ", "ЮВ", "ЮЮВ",
+            "Ю", "ЮЮЗ", "ЮЗ", "ЗЮЗ", "З", "ЗСЗ", "СЗ", "ССЗ"]
+    return dirs[int((deg % 360) / 22.5 + 0.5) % 16]
+
+
+def _moon_name(illum, waxing):
+    if illum is None:
+        return None
+    if illum < 0.06:
+        return "новолуние"
+    if illum > 0.94:
+        return "полнолуние"
+    if 0.44 < illum < 0.56:
+        return "первая четверть" if waxing else "последняя четверть"
+    return ("растущая луна" if waxing else "убывающая луна")
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+
+async def get_current_conditions(hass, lat, lon, timezone, elevation, weather_source, temp_sensor, pressure_sensor):
+    """Current weather + sun/moon/solunar at the pond's coordinates (shares the
+    per-location cache with the fish score sensors)."""
+    loc = await _get_location_data(hass, lat, lon, timezone, elevation, weather_source, temp_sensor, pressure_sensor)
+    if loc is None:
+        return {}
+    hourly, astro_data, used_source, local_used = loc
+    now = datetime.datetime.now()
+    today = now.date()
+    today_str = str(today)
+
+    cur = hourly[(hourly["date"] == today) & (hourly["hour"] == now.hour)]
+    if cur.empty:
+        t = hourly[hourly["date"] == today]
+        cur = t.head(1) if not t.empty else hourly.head(1)
+    if cur.empty:
+        return {}
+    row = cur.iloc[0]
+
+    astro = astro_data.get(today_str, {})
+    tom = astro_data.get(str(today + datetime.timedelta(days=1)), {})
+    illum = astro.get("moon_phase")
+    illum_t = tom.get("moon_phase")
+    waxing = (illum is not None and illum_t is not None and illum_t >= illum)
+
+    pt = _num(row.get("pressure_trend"))
+    trend = "стабильно" if pt is None else ("падает" if pt < -0.3 else ("растёт" if pt > 0.3 else "стабильно"))
+
+    def r(v, nd=0):
+        n = _num(v)
+        return None if n is None else (round(n, nd) if nd else round(n))
+
+    return {
+        "water_temp": r(row.get("temp"), 1),
+        "wind_speed": r(row.get("wind"), 1),
+        "wind_dir": _compass(row.get("wind_dir")),
+        "wind_dir_deg": r(row.get("wind_dir")),
+        "pressure": r(row.get("pressure")),
+        "pressure_trend": trend,
+        "cloud": r(row.get("cloud")),
+        "precip": r(row.get("precip"), 1),
+        "sunrise": astro.get("sunrise"),
+        "sunset": astro.get("sunset"),
+        "moonrise": astro.get("moonrise"),
+        "moonset": astro.get("moonset"),
+        "moon_illumination": round(illum * 100) if illum is not None else None,
+        "moon_phase_name": _moon_name(illum, waxing),
+        "solunar_major": [t for t in (astro.get("moon_transit"), astro.get("moon_underfoot")) if t],
+        "solunar_minor": [t for t in (astro.get("moonrise"), astro.get("moonset")) if t],
+        "weather_source": used_source,
+        "water_source": local_used.get("temp"),
+    }
 
 
 async def _apply_local_sensors(hass, hourly, temp_sensor, pressure_sensor, lat, lon, tz_name, elevation):

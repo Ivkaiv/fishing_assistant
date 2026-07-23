@@ -4,8 +4,22 @@ from typing import Dict
 from skyfield.api import load, wgs84
 from skyfield import almanac
 import os
+import math
 from homeassistant.core import HomeAssistant
 import logging
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _moon_illumination(eph, t):
+    """Illuminated fraction of the Moon (0.0 = new, 1.0 = full) from the
+    Sun-Moon ecliptic elongation. Robust across skyfield versions (does not
+    rely on almanac.fraction_illuminated)."""
+    e = eph["earth"].at(t)
+    _, mlon, _ = e.observe(eph["moon"]).apparent().ecliptic_latlon()
+    _, slon, _ = e.observe(eph["sun"]).apparent().ecliptic_latlon()
+    elong = (mlon.degrees - slon.degrees) % 360.0
+    return (1 - math.cos(math.radians(elong))) / 2.0
 
 
 async def calculate_astronomy_forecast(hass: HomeAssistant, lat: float, lon: float, tz_name: str = "UTC", days: int = 7) -> Dict[str, dict]:
@@ -109,10 +123,9 @@ async def calculate_astronomy_forecast(hass: HomeAssistant, lat: float, lon: flo
         ds = str(d)
         # Illuminated fraction of the Moon at local noon: 0.0 = new, 1.0 = full.
         try:
-            moon_frac = float(
-                almanac.fraction_illuminated(eph, "moon", ts.utc(d.year, d.month, d.day, 12))
-            )
-        except Exception:
+            moon_frac = round(float(_moon_illumination(eph, ts.utc(d.year, d.month, d.day, 12))), 3)
+        except Exception as ex:
+            _LOGGER.warning("Moon illumination failed: %s", ex)
             moon_frac = None
         forecast[ds] = {
             "moon_phase": moon_frac,

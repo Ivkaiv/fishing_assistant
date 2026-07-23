@@ -2,7 +2,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.helpers.event import (
     async_track_time_change,
@@ -12,7 +12,7 @@ from homeassistant.helpers.event import (
 from .const import DOMAIN
 import datetime
 
-from .score import get_fish_score_forecast, scale_score
+from .score import get_fish_score_forecast, scale_score, get_current_conditions
 
 
 def default_weather_source(hass) -> str:
@@ -72,6 +72,27 @@ async def async_setup_entry(
                 config_entry_id=config_entry.entry_id
             )
         )
+
+    # One "fishing conditions" sensor per location: weather + sun/moon/solunar
+    # at the pond's own coordinates.
+    sensors.append(
+        FishingConditionsSensor(
+            name=name, lat=lat, lon=lon, body_type=body_type, timezone=timezone,
+            elevation=elevation, weather_source=weather_source,
+            temp_sensor=temp_sensor, pressure_sensor=pressure_sensor,
+            config_entry_id=config_entry.entry_id,
+        )
+    )
+    # Pressure sensor per location so its 24h curve can be graphed (attributes
+    # aren't recorded as history, sensor states are).
+    sensors.append(
+        FishingPressureSensor(
+            name=name, lat=lat, lon=lon, timezone=timezone,
+            elevation=elevation, weather_source=weather_source,
+            temp_sensor=temp_sensor, pressure_sensor=pressure_sensor,
+            config_entry_id=config_entry.entry_id,
+        )
+    )
 
     async_add_entities(sensors)
 
@@ -238,3 +259,169 @@ class FishScoreSensor(SensorEntity):
             await self.async_update()
         else:
             self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, self._first_update)
+
+
+class FishingConditionsSensor(SensorEntity):
+    """Per-location weather + sun/moon/solunar conditions at the pond's coords."""
+
+    should_poll = False
+    _attr_icon = "mdi:waves"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = "°C"
+
+    def __init__(self, name, lat, lon, body_type, timezone, elevation, config_entry_id,
+                 weather_source=None, temp_sensor=None, pressure_sensor=None):
+        self._config_entry_id = config_entry_id
+        self._weather_source = weather_source
+        self._temp_sensor = temp_sensor
+        self._pressure_sensor = pressure_sensor
+        self._lat = lat
+        self._lon = lon
+        self._tz = timezone
+        self._elev = elevation
+        self._loc_name = name
+        self._device_identifier = f"{name}_{lat}_{lon}"
+        self._uid = f"{name.lower().replace(' ', '_')}_conditions"
+        self._friendly_name = f"{name} — условия рыбалки"
+        self._state = None
+        self._attrs = {"location": name}
+
+    @property
+    def name(self):
+        return self._friendly_name
+
+    @property
+    def unique_id(self):
+        return self._uid
+
+    @property
+    def native_value(self):
+        return self._state
+
+    @property
+    def extra_state_attributes(self):
+        return self._attrs
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._device_identifier)},
+            "name": self._loc_name,
+            "manufacturer": "Fishing Assistant",
+            "model": "Fishing Conditions",
+            "entry_type": "service",
+        }
+
+    def _effective_source(self) -> str:
+        if self._weather_source in (None, "", "auto"):
+            return default_weather_source(self.hass)
+        return self._weather_source
+
+    async def async_update(self):
+        cond = await get_current_conditions(
+            self.hass, self._lat, self._lon, self._tz, self._elev,
+            self._effective_source(), self._temp_sensor, self._pressure_sensor,
+        )
+        if cond:
+            self._state = cond.get("water_temp")
+            # latitude/longitude let the HA map card plot each pond.
+            self._attrs = {
+                "location": self._loc_name,
+                "latitude": self._lat,
+                "longitude": self._lon,
+                **cond,
+            }
+
+    async def _refresh(self, _now):
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._refresh, datetime.timedelta(minutes=15))
+        )
+        if self.hass.is_running:
+            await self.async_update()
+        else:
+            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, self._refresh)
+
+
+class FishingPressureSensor(SensorEntity):
+    """Per-location atmospheric pressure at the pond's coordinates, recorded so
+    its 24h curve can be graphed."""
+
+    should_poll = False
+    _attr_icon = "mdi:gauge"
+    _attr_device_class = SensorDeviceClass.ATMOSPHERIC_PRESSURE
+    _attr_native_unit_of_measurement = "hPa"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, name, lat, lon, timezone, elevation, config_entry_id,
+                 weather_source=None, temp_sensor=None, pressure_sensor=None):
+        self._config_entry_id = config_entry_id
+        self._weather_source = weather_source
+        self._temp_sensor = temp_sensor
+        self._pressure_sensor = pressure_sensor
+        self._lat = lat
+        self._lon = lon
+        self._tz = timezone
+        self._elev = elevation
+        self._loc_name = name
+        self._device_identifier = f"{name}_{lat}_{lon}"
+        self._uid = f"{name.lower().replace(' ', '_')}_pressure"
+        self._friendly_name = f"{name} — давление"
+        self._state = None
+        self._attrs = {"location": name}
+
+    @property
+    def name(self):
+        return self._friendly_name
+
+    @property
+    def unique_id(self):
+        return self._uid
+
+    @property
+    def native_value(self):
+        return self._state
+
+    @property
+    def extra_state_attributes(self):
+        return self._attrs
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self._device_identifier)},
+            "name": self._loc_name,
+            "manufacturer": "Fishing Assistant",
+            "model": "Fishing Conditions",
+            "entry_type": "service",
+        }
+
+    def _effective_source(self) -> str:
+        if self._weather_source in (None, "", "auto"):
+            return default_weather_source(self.hass)
+        return self._weather_source
+
+    async def async_update(self):
+        cond = await get_current_conditions(
+            self.hass, self._lat, self._lon, self._tz, self._elev,
+            self._effective_source(), self._temp_sensor, self._pressure_sensor,
+        )
+        if cond:
+            self._state = cond.get("pressure")
+            self._attrs = {"location": self._loc_name, "trend": cond.get("pressure_trend")}
+
+    async def _refresh(self, _now):
+        await self.async_update()
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._refresh, datetime.timedelta(minutes=15))
+        )
+        if self.hass.is_running:
+            await self.async_update()
+        else:
+            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, self._refresh)
